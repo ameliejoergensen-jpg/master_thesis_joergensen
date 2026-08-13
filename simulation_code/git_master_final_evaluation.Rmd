@@ -1,0 +1,478 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-08-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+rm(list = ls())
+library(data.table)
+library(ggplot2)
+library(ggh4x)
+library(xtable)
+
+```
+
+# Setup
+
+```{r}
+
+# set to folder where simulation results are stored
+res_dir <- "/Users/simulation_results_rda/"
+
+# set to folder where output figures should go
+out_dir <- "/Users/figures/"
+
+J <- 3
+R_eval <- 30
+R_vec <- rep(R_eval, J)
+
+models <- c("hmm", "nb", "cv", "aic", "nonp")
+model_lvls <- c("HMM", "nb-HSMM", "CV-HSMM", "AIC-HSMM", "qREML-HSMM")
+model_cols <- c("HMM" = "#999999",
+                "nb-HSMM" = "#0072B2",
+                "CV-HSMM" = "#E69F00",
+                "AIC-HSMM"= "#CC79A7",
+                "qREML-HSMM" = "#009E73")
+
+relab <- function(x){
+  factor(x, levels = models, labels = model_lvls)}
+
+# scenario 1-5 = medium overlap, 6-10 = high, so paired id is id+5
+
+meta <- data.table(
+  scenario_id = as.character(1:10),
+  dwell = rep(1:5, 2),
+  overlap = factor(rep(c("Medium", "High"), each = 5), levels = c("Medium", "High")))
+
+tag <- function(dt){
+  dt[meta, on = "scenario_id", `:=`(dwell = i.dwell, overlap = i.overlap)]
+  dt[]}
+
+
+```
+
+
+```{r}
+
+# function to construct the dwell time distirbution implied by the geometric tail (beyond the explicit part, but part of the fitted model)
+dwell_nonp <- function(d_r_i, R, R_eval){
+  out <- numeric(R_eval)
+  out[1:R] <- d_r_i # explicit part (unstructured start)
+  tail_mass <- max(1 - sum(d_r_i), 0) # reference category mass beyond Rvec_i
+  if (R_eval > R && tail_mass > 0){
+    cdf_Rm1 <- sum(d_r_i[1:(R - 1)])  # F(R-1)
+    haz_R <- d_r_i[R] / (1 - cdf_Rm1)   # ci[R]
+    cont <- 1 - haz_R # geometric continuation rate
+    rr <- seq_len(R_eval - R)
+    out[(R + 1):R_eval] <- tail_mass * (1 - cont) * cont^(rr - 1)
+  }
+  out
+}
+
+# build the dwell matrix over the same support as used for simulation
+# needed for faithful MSSE
+# makes it possible to spot a too small R_vec
+build_dwell_matrix <- function(pars, model, J, R_vec, R_eval){
+  D <- matrix(0, J, R_eval)
+  for (i in 1:J){
+    if (model == "nonp"){
+      D[i, ] <- dwell_nonp(pars$d_r[[i]], R_vec[i], R_eval)
+    } else if (model == "nb"){
+      D[i, ] <- dnbinom(0:(R_eval - 1), mu = pars$nb_mu[i], size = pars$nb_size[i]) # shifted
+    } else if (model == "hmm"){
+      a_ii <- diag(pars$hmm_tpm)[i]
+      D[i, ] <- dgeom(0:(R_eval - 1), p = (1 - a_ii))
+    }
+    D[i, ] <- D[i, ] / sum(D[i, ])
+  }
+  D
+}
+
+
+```
+
+```{r}
+
+# read in simulation results
+runs_all <- setNames(lapply(c(1:10), function(id){
+  load(file.path(res_dir, sprintf("scenario_%d_all_runs.rda", id)))
+  runs
+}), 1:10)
+
+
+```
+
+
+## Build tables
+
+
+```{r}
+
+# Sum of squared error
+ise <- tag(rbindlist(lapply(runs_all, function(runs)
+  rbindlist(lapply(runs, function(r)
+    rbindlist(lapply(models, function(m){
+      x <- r[[m]]$ise
+      if (!is.list(x)) return(NULL)
+      data.table(model = m, state = seq_along(x$per_state), ise = x$per_state)
+    }))))), idcol = "scenario_id"))
+ise[, `:=`(model = relab(model), state = paste("State", state))]
+
+# estimated dwell-time distributions
+type <- c(hmm = "hmm", nb = "nb", cv = "nonp", aic = "nonp", nonp = "nonp")
+extract_dw <- function(runs, R_state){
+  rbindlist(lapply(runs, function(r)
+    rbindlist(lapply(names(type), function(m){
+      p <- r[[m]]$pars
+      if (is.null(p)) return(NULL)
+      D <- build_dwell_matrix(p, type[[m]], J, rep(R_state, J), R_eval)
+      data.table(model = m,
+                 state = rep(seq_len(nrow(D)), times = ncol(D)),
+                 duration = rep(seq_len(ncol(D)), each  = nrow(D)),
+                 prob = as.vector(D))
+    }))))}
+
+dw <- rbindlist(lapply(names(runs_all), function(id)
+  extract_dw(runs_all[[id]], if (id %in% c("5", "10")) 20 else 30)), # R_vec was only 20 for SPIKE scenario since this captured most of the probability mass
+  idcol = "scenario_id")
+dw[, scenario_id := as.character(scenario_id)]
+dw <- tag(dw)
+
+dw[, `:=`(model = relab(model), state = paste("State", state))]
+
+# true dwell-time distributions
+source("git_master_make_scenarios_complex.R")
+sc_csv <- read.csv("master_scenarios_complex.csv")
+
+pad <- function(v, n){ 
+  o <- numeric(n)
+  k <- min(length(v), n)
+  o[seq_len(k)] <- v[seq_len(k)]
+  o 
+}
+
+truth <- rbindlist(lapply(1:5, function(d){
+  soj <- sojourn_distributions[[ sc_csv$sojourn[sc_csv$scenario_id == d] ]]
+  D <- t(sapply(soj[1:J], function(x) pad(x / sum(x), R_eval))) # J x R_eval
+  data.table(dwell = d,
+             state = paste("State", rep(seq_len(J), times = R_eval)),
+             duration = rep(seq_len(R_eval), each = J),
+             prob = as.vector(D))
+}))[, k := 1L]
+
+grid <- CJ(overlap = factor(c("Medium", "High"), levels = c("Medium", "High")),
+            model = factor(model_lvls, levels = model_lvls))[, k := 1L]
+truth <- merge(truth, grid, by = "k", allow.cartesian = TRUE)[, k := NULL]
+
+# decoding accuracy
+acc <- tag(rbindlist(lapply(runs_all, function(runs)
+  rbindlist(lapply(runs, function(r)
+    rbindlist(lapply(models, function(m){
+      g <- r[[m]]$accuracy
+      l <- r[[m]]$local_accuracy
+      if (is.null(g) || is.na(g[1])) return(NULL)
+      data.table(model = m, Global = g, Local = l)
+    }))))), idcol = "scenario_id"))
+
+acc[, model := relab(model)]
+acc <- melt(acc, id.vars = c("scenario_id", "model", "dwell", "overlap"),
+            variable.name = "decoder", value.name = "acc")
+
+# State-dependent mean bias
+true_mu <- rbindlist(list(
+  data.table(overlap = "Medium", variable = rep(c("Variable 1", "Variable 2"), each = J),
+             state = rep(seq_len(J), 2), truth = c(0, 1, 2, 2, 3, 4)),
+  data.table(overlap = "High",   variable = rep(c("Variable 1", "Variable 2"), each = J),
+             state = rep(seq_len(J), 2), truth = c(0, 0.7, 1.4, 2, 2.7, 3.4))
+))[, overlap := factor(overlap, levels = c("Medium", "High"))]
+
+mu <- tag(rbindlist(lapply(runs_all, function(runs)
+  rbindlist(lapply(runs, function(r)
+    rbindlist(lapply(models, function(m){
+      p <- r[[m]]$pars
+      if (is.null(p)) return(NULL)
+      data.table(model = m,
+                 state = rep(seq_len(J), 2),
+                 variable = rep(c("Variable 1", "Variable 2"), each = J),
+                 mu = c(p$mu1, p$mu2))
+    }))))), idcol = "scenario_id"))
+
+mu[, model := relab(model)]
+mu[true_mu, on = .(variable, state, overlap), err := mu - i.truth]
+emis <- mu[, .(med = median(err), lo = quantile(err, .25), hi = quantile(err, .75)),
+           by = .(dwell, overlap, model, state, variable)][, state := factor(state)]
+
+
+# Selected lambda
+pen_models <- c("cv", "aic", "nonp")
+lam <- tag(rbindlist(lapply(runs_all, function(runs)
+  rbindlist(lapply(runs, function(r)
+    rbindlist(lapply(pen_models, function(m){
+      
+      x <- if (m == "nonp") r[[m]]$pars$lambda else r[[m]]$lambda
+      
+      if (is.null(x)) return(NULL)
+      
+      data.table(model = m, state = seq_along(x), lambda = x)
+    }))))), idcol = "scenario_id"))
+
+lam[, `:=`(model = factor(model, levels = pen_models,
+                          labels = c("CV-HSMM", "AIC-HSMM", "qREML-HSMM")),
+           state = paste("State", state))]
+
+# Run-time needed
+tim <- tag(rbindlist(lapply(runs_all, function(runs)
+  rbindlist(lapply(runs, function(r)
+    rbindlist(lapply(models, function(m){
+      e <- r[[m]]$elapsed
+      if (is.null(e) || is.na(e) || e < 0.001) return(NULL) # catch potential failures
+      data.table(model = m, elapsed = e)
+    }))))), idcol = "scenario_id"))
+tim[, model := relab(model)]
+
+
+```
+
+
+## Plot helpers
+
+```{r}
+
+theme_big <- theme_bw(base_size = 11) +
+  theme(strip.text = element_text(size = 15),
+        axis.text = element_text(size = 13, colour = "black"),   
+        axis.title = element_text(size = 18, colour = "black"))
+
+plot_dwell <- function(d){
+  ggplot(dw[dwell == d], aes(duration, prob)) +
+    geom_boxplot(aes(group = duration, fill = model), lwd = 0.2, outlier.size = 0.2) +
+    geom_line(data = truth[dwell == d], linewidth = 0.4) +
+    facet_nested(overlap + state ~ model, scales = "free_y") +
+    scale_fill_manual(values = model_cols) +
+    labs(x = "Dwell duration", y = "Estimated probability") +
+    theme_big +
+    theme(legend.position = "none")}
+
+plot_ise <- function(d){
+  ggplot(ise[dwell == d], aes(model, sqrt(ise), fill = model)) + # take the root for better visibility
+    geom_boxplot(outlier.size = 0.4, lwd = 0.3) +
+    facet_grid(state ~ overlap) +
+    scale_fill_manual(values = model_cols) +
+    labs(x = NULL, y = "Root summed squared error") +
+    theme_big +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 45, hjust = 1))}
+
+acc_rng <- range(acc$acc) # accuracy plots should share same range to ensure fair visual comparison
+plot_acc <- function(d){
+  ggplot(acc[dwell == d], aes(model, acc, fill = model)) +
+    geom_boxplot(outlier.size = 0.4, lwd = 0.3) +
+    scale_fill_manual(values = model_cols) +
+    coord_cartesian(ylim = acc_rng) +
+    facet_grid(overlap ~ decoder) +
+    labs(x = NULL, y = "Accuracy") +
+    theme_big +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 45, hjust = 1))}
+
+M_emis <- emis[, max(abs(c(lo, hi)))] # same for emission plots
+plot_emis <- function(d){
+  ggplot(emis[dwell == d], aes(state, med, color = model)) +
+    geom_hline(yintercept = 0, linetype = 2, linewidth = 0.3) +
+    geom_pointrange(aes(ymin = lo, ymax = hi),
+                    position = position_dodge(0.6), size = 0.15) +
+    facet_grid(overlap ~ variable) +
+    scale_color_manual(values = model_cols) +
+    coord_cartesian(ylim = c(-M_emis, M_emis)) +
+    labs(x = "State", y = expression(hat(mu) - mu), color = NULL) +
+    theme_big +
+    theme(legend.position = "bottom",
+          legend.text = element_text(size = 13.2),
+          legend.spacing.x = unit(1.6, "pt"),
+          axis.title.x  = element_text(size = 13, colour = "black"))}
+
+# draw inline and save the PDF in one call
+emit <- function(p, file, w, h){
+  ggsave(file.path(out_dir, file), p, width = w, height = h)
+  print(p)
+  invisible(p)
+}
+
+# all four panels for one dwell scenario
+panels <- function(d){
+  emit(plot_dwell(d), sprintf("dwell_%d.pdf", d), 16, 10)
+  emit(plot_ise(d), sprintf("root_ise_%d.pdf", d),  7,  6)
+  emit(plot_acc(d), sprintf("accuracy_%d.pdf", d),  7,  6)
+  emit(plot_emis(d), sprintf("emis_%d.pdf", d),  7,  6)
+}
+
+
+```
+
+# Dwell scenario 1
+
+```{r}
+
+panels(1)
+
+```
+
+# Dwell scenario 2
+
+```{r}
+
+panels(2)
+
+```
+
+# Dwell scenario 3
+
+```{r}
+
+panels(3)
+
+```
+
+# Dwell scenario 4
+
+```{r}
+
+panels(4)
+
+```
+
+# Dwell scenario 5
+
+```{r}
+
+panels(5)
+
+```
+
+# Runtime
+
+```{r}
+
+p_tim <- ggplot(tim, aes(x = model, y = (elapsed/60), fill = model)) + # plot in minutes
+  geom_boxplot(outlier.size = 0.4) +
+  facet_grid(. ~ overlap) +
+  scale_fill_manual(values = model_cols) +
+  labs(x = NULL, y = "Runtime in minutes") +
+  theme_big +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+emit(p_tim, "runtime.pdf", 7, 4)
+
+timtab <- tim[, .(median_m = median(elapsed) / 60,
+                  q25 = quantile(elapsed, .25) / 60,
+                  q75 = quantile(elapsed, .75) / 60), by = model]
+
+timtab[, ratio := median_m / median_m[model == "qREML-HSMM"]] # ratios relative to qREML-HSMM
+
+timtab[, cell  := sprintf("%.2f [%.2f, %.2f]", median_m, q25, q75)]
+
+print(xtable(timtab[, .(model, cell, ratio)], digits = c(2, 2, 2, 2),
+             caption = "Runtime per fit (min), pooled across all scenarios. Median [IQR]; ratio relative to qREML-HSMM.", label = "tab:runtime"), booktabs = TRUE, include.rownames = FALSE)
+
+```
+
+# Plot for lambda
+
+```{r}
+
+# adjust size a bit
+theme_big <- theme_bw(base_size = 11) +
+  theme(strip.text = element_text(size = 14),
+        axis.text.y = element_text(size = 9.3, colour = "black"), 
+        axis.text.x = element_text(size = 13, colour = "black"),
+        axis.title = element_text(size = 18, colour = "black"))
+
+
+p_lam <- ggplot(lam[lambda > 0], aes(model, lambda, fill = model)) +
+  geom_boxplot(outlier.size = 0.4) +
+  facet_nested(dwell + overlap ~ state,
+               labeller = labeller(dwell = c("1" = "Baseline", "2" = "One-NB",
+                                             "3" = "One-MIX", "4" = "NB-PEAK",
+                                             "5" = "All-PEAK"))) +
+  scale_y_log10(breaks = 10^(0:6),
+                labels = scales::label_math(10^.x)(0:6),
+                expand = expansion(mult = c(0.12, 0.12))) +
+  coord_cartesian(ylim = c(1, 1e6)) +
+  scale_fill_manual(values = model_cols[c("CV-HSMM", "AIC-HSMM", "qREML-HSMM")]) +
+  labs(x = NULL, y = expression("Chosen smoothing parameter " * lambda)) +
+  theme_big +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+emit(p_lam, "lambda_all.pdf", 8, 11)
+
+
+```
+
+
+# Create latex tables
+
+
+```{r}
+
+# state-dependent SD estimates
+sig <- tag(rbindlist(lapply(runs_all, function(runs)
+  rbindlist(lapply(runs, function(r)
+    rbindlist(lapply(models, function(m){
+      p <- r[[m]]$pars
+      if (is.null(p)) return(NULL)
+      data.table(model = m,
+                 state = rep(seq_len(J), 2),
+                 variable = rep(c("Variable 1", "Variable 2"), each = J),
+                 sd = c(p$sigma1, p$sigma2))
+    }))))), idcol = "scenario_id"))
+
+sig[, model := relab(model)]
+sig[, err := sd - 1] # true sd is one always
+
+```
+
+
+```{r}
+
+# mean sum of squared errors
+# multiplied by 1000
+mise <- ise[, .(mise = 1000 * mean(ise), mcse = 1000 * (sd(ise) / sqrt(.N))),
+            by = .(overlap, dwell, model, state)]
+mise[, cell := sprintf("%.2f (%.2f)", mise, mcse)]
+
+print(xtable(dcast(mise, dwell + model ~ overlap + state, value.var = "cell"),
+             caption = "MSSE x1000 (MCSE), both overlaps.", label = "tab:mise"),
+      booktabs = TRUE, include.rownames = FALSE, size = "\\footnotesize")
+
+# accuracy
+accs <- acc[, .(acc = 100 * mean(acc)), by = .(overlap, dwell, model, decoder)]
+print(xtable(dcast(accs, overlap + decoder + model ~ dwell, value.var = "acc"),
+             caption = "Decoding accuracy (%).", label = "tab:acc", digits = 2),
+      booktabs = TRUE, include.rownames = FALSE)
+
+# MAE
+mae <- rbind(
+  mu [, .(v = mean(abs(err))), by = .(overlap, dwell, model, state, variable)][, par := "Mean"],
+  sig[, .(v = mean(abs(err))), by = .(overlap, dwell, model, state, variable)][, par := "SD"])
+mae[, cell := formatC(v, format = "f", digits = 3)]
+
+
+for (pp in c("Mean", "SD"))
+  print(xtable(dcast(mae[par == pp], dwell + model ~ overlap + variable + state, value.var = "cell"),
+               caption = sprintf("MAE of estimated state %ss, both overlaps.", tolower(pp)),
+               label = sprintf("tab:mae-%s", tolower(pp))),
+        booktabs = TRUE, include.rownames = FALSE, size = "\\footnotesize")
+
+```
+
+
+
+

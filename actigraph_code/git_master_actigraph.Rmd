@@ -1,0 +1,1101 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-07-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+rm(list = ls())
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(ggh4x)
+library(RTMB)
+library(LaMa)
+library(clue)
+library(actigraph.sleepr)
+library(purrr)
+library(lubridate)
+library(nparACT)
+
+```
+
+# Table 1
+
+```{r}
+
+scores <- read.csv("scores.csv")
+setDT(scores)
+scores[, group := fifelse(grepl("condition", number), "Depression", "Control")]
+
+```
+
+
+# Actigraph data
+
+```{r}
+
+# conditions (depressed)
+
+# adjust as needed to correct directories
+files <- list.files("/Downloads/depresjon/condition/")
+path <- "/Downloads/depresjon/condition/"
+
+condition_all <- lapply(files, function(f){
+  d <- read.csv(paste0(path, f))
+  d$subject <- tools::file_path_sans_ext(f)
+  d
+})
+
+
+# control
+
+# adjust as needed
+control_files <- list.files("/Downloads/depresjon/control/")
+control_path <- "/Downloads/depresjon/control/"
+
+control_all <- lapply(control_files, function(f){
+  d <- read.csv(paste0(control_path, f))
+  d$subject <- tools::file_path_sans_ext(f)
+  d
+})
+
+```
+
+
+
+# Helper functions
+
+```{r}
+
+# create 15 minute bins for sleep-wake cycle
+aggregate_15min <- function(d){
+  d %>%
+    mutate(bin = floor_date(timestamp, "15 minutes")) %>%
+    group_by(bin) %>%
+    summarise(
+      activity = mean(activity),
+      label = if_else(mean(sleep == "S") > 0.5, "S", "W"),
+      .groups = "drop"
+    )
+}
+
+# take into account that after data cleaning, one subject can have two recordings
+# so take average for subject weighted by length of recording (for overall fit)
+npar_subj <- function(npar, group){
+  npar %>%
+    group_by(id) %>%
+    summarise(across(c(IS, IV, RA), ~ weighted.mean(.x, n_epochs)), .groups = "drop") %>%
+    mutate(group = group)
+}
+
+act_subj <- function(segs, group){
+  do.call(rbind, lapply(segs, function(s)
+    data.frame(id = s$id[1], n = nrow(s), activity = mean(s$activity)))) %>%
+    group_by(id) %>%
+    summarise(activity = weighted.mean(activity, n), .groups = "drop") %>%
+    mutate(group = group)
+}
+
+bin_segments <- function(segs){
+  lapply(segs, function(s){
+    b <- aggregate_15min(s)
+    b$timestamp <- b$bin
+    b$id <- s$id[1]
+    b$seg <- s$seg[1]
+    b
+  })
+}
+
+
+```
+
+
+```{r}
+
+settings <- data.frame(epochlength = 60L)
+min_epochs <- 48 * 60
+
+condition_segments <- unlist(lapply(seq_along(condition_all), function(n){
+  d <- condition_all[[n]] %>%
+    mutate(timestamp = as.POSIXct(timestamp, tz = "Europe/Oslo"),
+           axis1 = activity, axis2 = 0, axis3 = 0)
+  
+  d <- d[!is.na(d$timestamp), ]
+  d <- d[!duplicated(d$timestamp), ]
+
+  # Choi for non-wear
+  periods <- apply_choi(tbl_agd(d, settings),
+                        use_magnitude = FALSE, min_period_len = 540)
+
+  # Drop non-wear epochs
+  if (nrow(periods) > 0){
+    nonwear <- Reduce(`|`, Map(function(s, e) d$timestamp >= s & d$timestamp <= e,
+                           periods$period_start, periods$period_end))
+    d <- d[!nonwear, ]
+  }
+  if (nrow(d) == 0) return(NULL)
+
+  # Continuous segments of at least 48h
+  gap <- c(TRUE, diff(as.numeric(d$timestamp)) != 60)
+  segs <- split(d, cumsum(gap))
+  segs <- segs[sapply(segs, nrow) >= min_epochs]
+  if (length(segs) == 0) return(NULL)
+
+  # Cole-Kripke per segment
+  lapply(seq_along(segs), function(i){
+    s <- apply_cole_kripke(tbl_agd(segs[[i]], settings))
+    s$id <- segs[[i]]$subject[1]
+    s$seg <- i
+    s
+  })
+}), recursive = FALSE)
+
+```
+
+
+```{r}
+
+control_segments <- unlist(lapply(seq_along(control_all), function(n){
+  d <- control_all[[n]] %>%
+    mutate(timestamp = as.POSIXct(timestamp, tz = "Europe/Oslo"),
+           axis1 = activity, axis2 = 0, axis3 = 0)
+  
+  d <- d[!is.na(d$timestamp), ]
+  d <- d[!duplicated(d$timestamp), ]
+
+  # Choi for non-wear
+  periods <- apply_choi(tbl_agd(d, settings),
+                        use_magnitude = FALSE, min_period_len = 540)
+
+  # Drop non-wear epochs
+  if (nrow(periods) > 0){
+    nonwear <- Reduce(`|`, Map(function(s, e) d$timestamp >= s & d$timestamp <= e,
+                           periods$period_start, periods$period_end))
+    d <- d[!nonwear, ]
+  }
+  if (nrow(d) == 0) return(NULL)
+
+  # Continuous segments of at least 48h
+  gap <- c(TRUE, diff(as.numeric(d$timestamp)) != 60)
+  segs <- split(d, cumsum(gap))
+  segs <- segs[sapply(segs, nrow) >= min_epochs]
+  if (length(segs) == 0) return(NULL)
+
+  # Cole-Kripke per segment
+  lapply(seq_along(segs), function(i){
+    s <- apply_cole_kripke(tbl_agd(segs[[i]], settings))
+    s$id <- segs[[i]]$subject[1]
+    s$seg <- i
+    s
+  })
+}), recursive = FALSE)
+
+```
+
+
+```{r}
+
+# condition and control bins will contain the cleaned segments (dropped non-wear, Cole-Kripke labels, split into continuous segments and aggregated to 15 minutes)
+# do sensitivity tests on condition and control all
+
+condition_bins <- bin_segments(condition_segments)
+control_bins <- bin_segments(control_segments)
+
+```
+
+
+```{r}
+
+# condition_all and control_all do NOT get aggregated to 15-min epochs
+# use for sensitivity checks
+# but remove non-wear as this represents invalid data
+
+condition_all <- lapply(condition_all, function(d){
+  d <- d %>%
+    mutate(timestamp = as.POSIXct(timestamp, tz = "Europe/Oslo"),
+           axis1 = activity, axis2 = 0, axis3 = 0)
+  d <- d[!is.na(d$timestamp), ]
+  d <- d[!duplicated(d$timestamp), ]
+  periods <- apply_choi(tbl_agd(d, settings), use_magnitude = FALSE, min_period_len = 540)
+  if (nrow(periods) > 0){
+    nonwear <- Reduce(`|`, Map(function(s, e) d$timestamp >= s & d$timestamp <= e,
+                               periods$period_start, periods$period_end))
+    d <- d[!nonwear, ]
+  }
+  d
+})
+
+control_all <- lapply(control_all, function(d){
+  d <- d %>%
+    mutate(timestamp = as.POSIXct(timestamp, tz = "Europe/Oslo"),
+           axis1 = activity, axis2 = 0, axis3 = 0)
+  d <- d[!is.na(d$timestamp), ]
+  d <- d[!duplicated(d$timestamp), ]
+  periods <- apply_choi(tbl_agd(d, settings), use_magnitude = FALSE, min_period_len = 540)
+  if (nrow(periods) > 0){
+    nonwear <- Reduce(`|`, Map(function(s, e) d$timestamp >= s & d$timestamp <= e,
+                               periods$period_start, periods$period_end))
+    d <- d[!nonwear, ]
+  }
+  d
+})
+
+```
+
+
+
+# Plot
+
+
+```{r}
+
+control1 <- control_segments[[1]] # example subject
+
+ggplot(control1[1021:2461, ], aes(x = timestamp, y = log1p(activity), fill = sleep)) +
+  geom_col() +
+  scale_fill_manual(values = c(S = "#3B6EA5", W = "#E8A33D")) +
+  labs(x = "Time", y = "Activity count", fill = NULL) +
+  theme_minimal()
+
+```
+
+# RA, IS and IV
+
+
+```{r}
+
+# compute using nparACT
+# 15 minute epochs and 24 hour reference (standard)
+
+condition_npar <- do.call(rbind, lapply(condition_bins, function(s){
+  assign("dat", data.frame(timestamp = s$timestamp, activity = s$activity),
+         envir = .GlobalEnv)
+  r <- nparACT_base("dat", SR = 1/900, plot = FALSE)
+  data.frame(id = s$id[1], seg = s$seg[1], n_epochs = nrow(s), r)
+}))
+
+control_npar <- do.call(rbind, lapply(control_bins, function(s){
+  assign("dat", data.frame(timestamp = s$timestamp, activity = s$activity),
+         envir = .GlobalEnv)
+  r <- nparACT_base("dat", SR = 1/900, plot = FALSE)
+  data.frame(id = s$id[1], seg = s$seg[1], n_epochs = nrow(s), r)
+}))
+
+```
+
+
+```{r}
+
+# test difference
+
+npar_all <- bind_rows(npar_subj(condition_npar, "Depression"),
+                      npar_subj(control_npar, "Control"))
+
+## test
+
+wilcox_is <- wilcox.test(npar_all$IS ~ npar_all$group, exact = FALSE)
+wilcox_iv <- wilcox.test(npar_all$IV ~ npar_all$group, exact = FALSE)
+wilcox_ra <- wilcox.test(npar_all$RA ~ npar_all$group, exact = FALSE)
+
+# apply Holm correction below (multiple tests)
+
+setDT(npar_all)
+summary <- npar_all[, .(med_IS = median(IS), q1_IS = quantile(IS, .25), q3_IS = quantile(IS, .75),
+                        med_IV = median(IV), q1_IV = quantile(IV, .25), q3_IV = quantile(IV, .75),
+                        med_RA = median(RA), q1_RA = quantile(RA, .25), q3_RA = quantile(RA, .75)),
+                    by = group]
+summary
+
+```
+
+
+
+
+## Sensitivity check - no non-wear removal and no aggregation to 15 minute bins
+
+
+```{r}
+
+npar_raw <- function(all, group){
+  do.call(rbind, lapply(all, function(d){
+    assign("dat", data.frame(timestamp = as.POSIXct(d$timestamp, tz = "Europe/Oslo"),
+                             activity  = d$activity), envir = .GlobalEnv)
+    data.frame(id = d$subject[1], group = group,
+               nparACT_base("dat", SR = 1/60, plot = FALSE))
+  }))
+}
+
+npar_noagg <- rbind(npar_raw(condition_all, "Depression"),
+                     npar_raw(control_all, "Control"))
+
+```
+
+
+```{r}
+
+# test difference
+
+wilcox_is_sens <- wilcox.test(npar_noagg$IS ~ npar_noagg$group, exact = FALSE)
+wilcox_iv_sens <- wilcox.test(npar_noagg$IV ~ npar_noagg$group, exact = FALSE)
+wilcox_ra_sens <- wilcox.test(npar_noagg$RA ~ npar_noagg$group, exact = FALSE)
+
+wilcox_is_sens
+
+wilcox_iv_sens
+
+wilcox_ra_sens
+
+```
+
+
+# Total activity count
+
+```{r}
+
+prof <- bind_rows(
+  bind_rows(condition_bins) %>% mutate(group = "Group with depressive disorders"),
+  bind_rows(control_bins) %>% mutate(group = "Control group")
+) %>%
+  mutate(tod = as.numeric(format(bin, "%H")) + as.numeric(format(bin, "%M")) / 60) %>%
+  group_by(group, id, tod) %>%
+  summarise(activity = mean(activity), .groups = "drop") %>%
+  group_by(group, tod) %>%
+  summarise(activity = mean(activity), .groups = "drop")
+
+activity_plot <- ggplot(prof, aes(tod, activity, colour = group, linetype = group)) +
+  geom_line(linewidth = 0.8) +
+  scale_x_continuous(breaks = seq(0, 24, 4),
+                     labels = sprintf("%02d:00", seq(0, 24, 4)),
+                     expand = c(0, 1)) +
+  scale_colour_manual(values = c("Group with depressive disorders" = "#1B7837", "Control group" = "#333333")) +
+  labs(x = "Time of day", y = "Mean activity count / 15-min epoch",
+       colour = NULL, linetype = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top")
+
+ggsave(filename = "activity_plot.pdf", activity_plot, width = 7, height = 5)
+
+
+```
+
+
+```{r}
+
+act <- bind_rows(act_subj(condition_bins, "Depression"),
+                 act_subj(control_bins, "Control"))
+
+t_act <- t.test(activity ~ group, data = act)
+
+act %>% group_by(group) %>% summarise(mean = mean(activity), sd = sd(activity))
+
+```
+
+
+# Holm correction
+
+```{r}
+
+p_vals <- c(wilcox_is$p.value, wilcox_iv$p.value, wilcox_ra$p.value, t_act$p.value)
+
+p.adjust(p_vals, method = "holm") # adjusted
+
+p_vals # original
+
+
+```
+
+
+## Holm correction for sensitivity checks
+
+```{r}
+
+p_vals_sens <- c(wilcox_is_sens$p.value, wilcox_iv_sens$p.value, wilcox_ra_sens$p.value)
+
+p.adjust(p_vals_sens, method = "holm") # Holm correctio but for sensitivity checks
+
+p_vals_sens # original ones
+
+```
+
+
+# Hidden Markov Models
+
+## Check what emissions appropriate
+
+```{r}
+
+condition <- lapply(condition_segments, function(s){
+  b <- aggregate_15min(s)
+  b$id <- s$id[1]
+  b$seg <- s$seg[1]
+  b
+})
+
+control <- lapply(control_segments, function(s){
+  b <- aggregate_15min(s)
+  b$id <- s$id[1]
+  b$seg <- s$seg[1]
+  b
+})
+
+```
+
+
+```{r}
+
+emis <- bind_rows(
+  bind_rows(condition) %>% mutate(group = "Depression"),
+  bind_rows(control) %>% mutate(group = "Control")) 
+
+brk <- c(-0.5, 0.5, seq(10, quantile(emis$activity, 0.99), length = 40))
+
+ggplot(emis, aes(activity, fill = label)) +
+  geom_histogram(aes(y = after_stat(density)), breaks = brk,
+                 alpha = 0.5, position = "identity", colour = NA) +
+  coord_cartesian(xlim = c(0, 800), ylim = c(0, 0.008)) +
+  facet_wrap(~ group) +
+  scale_fill_manual(values = c(S = "#3B6EA5", W = "#E8A33D"),
+                    labels = c(S = "Sleep", W = "Wake")) +
+  labs(x = "Mean activity count per 15-min epoch", y = "Density", fill = NULL) +
+  theme_classic()
+
+```
+
+
+## HMM
+
+## HMM for condition
+
+
+```{r}
+
+source("git_master_act_functions.R")
+
+condition_data <- lapply(condition_bins, function(d){
+  matrix(as.numeric(d$activity), ncol = 1)
+})
+
+J <- 2
+mu0 <- matrix(c(20, 250), nrow = 1) # K x J: rest low, active high (counts)
+sigma0 <- matrix(c(30, 200), nrow = 1)    # K x J: SD in counts
+z0 <- matrix(c(0.15, 0.001), nrow = 1) # K x J: P(exact zero) per state
+tpm0 <- matrix(c(0.9, 0.1,
+                   0.1, 0.9), nrow = 2, byrow = TRUE)
+
+hmm_fit <- mle_hmm_multiple(mu0, sigma0, z0, tpm0, J, condition_data)
+
+```
+
+
+```{r}
+
+fitted_states <- my_viterbi_decoder(hmm_fit$delta, hmm_fit$tpm, condition_data, J, 
+                                    hmm_fit$mu, hmm_fit$sigma, hmm_fit$z ,model = "HMM")
+
+cole_condition_labels <- rbindlist(condition_bins)$label
+
+fitted_states <- unlist(fitted_states)
+
+cm <- table(fitted_states, cole_condition_labels)
+
+assign <- solve_LSAP(cm, maximum = TRUE)
+aligned_states <- assign[fitted_states]
+
+cm <- table(cole_condition_labels, aligned_states)
+
+cat("State assignment is: \n")
+assign
+
+cat("Proportion of time spent in each state for condition: \n")
+table(fitted_states)/length(fitted_states)
+
+cat("Activity counts for condition: \n")
+hmm_fit$mu
+
+hmm_fit$sigma
+
+hmm_fit$z
+
+cat("t.p.m. for conditions: \n")
+hmm_fit$tpm
+
+```
+
+
+```{r}
+
+n <- sum(cm) 
+nc <- nrow(cm)
+diag <- diag(cm) 
+rowsums <- apply(cm, 1, sum)
+colsums <- apply(cm, 2, sum) 
+p <- rowsums / n 
+q <- colsums / n 
+
+accuracy <- sum(diag) / n 
+
+cat("Agreement with Cole-Kripke for conditions: \n")
+accuracy
+
+# accuracy 
+# 
+# precision = diag/colsums 
+# recall = diag/rowsums 
+# f1 = 2 * precision * recall / (precision + recall) 
+# data.frame(precision, recall, f1) 
+
+
+```
+
+## HMM for control
+
+
+```{r}
+
+control_data <- lapply(control_bins, function(d){
+  matrix(as.numeric(d$activity), ncol = 1)
+})
+
+# same as for condition
+
+# J <- 2
+# mu0 <- matrix(c(20, 250), nrow = 1) # K x J: rest low, active high (counts)
+# sigma0 <- matrix(c(30, 200), nrow = 1)    # K x J: SD in counts
+# z0  <- matrix(c(0.15, 0.001), nrow = 1) # K x J: P(exact zero) per state
+# tpm0 <- matrix(c(0.9, 0.1,
+#                    0.1, 0.9), nrow = 2, byrow = TRUE)
+
+hmm_fit_control <- mle_hmm_multiple(mu0, sigma0, z0, tpm0, J, control_data)
+
+```
+
+
+```{r}
+
+fitted_states <- my_viterbi_decoder(hmm_fit_control$delta, hmm_fit_control$tpm, control_data, J, 
+                                    hmm_fit_control$mu, hmm_fit_control$sigma, hmm_fit_control$z ,model = "HMM")
+
+cole_control_labels <- rbindlist(control_bins)$label
+
+fitted_states <- unlist(fitted_states)
+
+cm <- table(fitted_states, cole_control_labels)
+
+assign <- solve_LSAP(cm, maximum = TRUE)
+aligned_states <- assign[fitted_states]
+
+cm <- table(cole_control_labels, aligned_states)
+
+cat("State assignment is: \n")
+assign
+
+cat("Proportion of time spent in each state for control: \n")
+table(fitted_states)/length(fitted_states)
+  
+
+cat("Activity counts for controls: \n")
+hmm_fit_control$mu
+
+hmm_fit_control$sigma
+
+hmm_fit_control$z
+
+cat("t.p.m. for controls: \n")
+hmm_fit_control$tpm
+
+```
+
+
+```{r}
+
+n <- sum(cm) 
+nc <- nrow(cm)
+diag <- diag(cm) 
+rowsums <- apply(cm, 1, sum) 
+colsums <- apply(cm, 2, sum) 
+p <- rowsums / n 
+q <- colsums / n 
+
+accuracy <- sum(diag) / n 
+
+cat("Agreement with Cole-Kripke for controls: \n")
+accuracy
+
+# accuracy 
+# 
+# precision = diag/colsums 
+# recall = diag/rowsums 
+# f1 = 2 * precision * recall / (precision + recall) 
+# data.frame(precision, recall, f1) 
+
+```
+
+
+## nb-HSMM
+
+## nb-HSMM for condition
+
+
+```{r}
+
+R_vec <- c(40, 80)
+
+nb_size0 <- c(2, 2)       
+nb_mu0 <- c(10, 10) # match HMM init t.p.m.
+
+cond_tpm0 <- matrix(c(0, 1,
+                      1, 0), nrow = 2, byrow = TRUE) # since J = 2
+
+nbhsmm_fit <- mle_nbhsmm_multiple(mu0, sigma0, z0, nb_size0, nb_mu0, cond_tpm0,
+                                  J, condition_data, R_vec)
+
+```
+
+```{r}
+
+fitted_states <- my_viterbi_decoder(nbhsmm_fit$delta, nbhsmm_fit$tpm, condition_data, J, 
+                                    nbhsmm_fit$mu, nbhsmm_fit$sigma, nbhsmm_fit$z ,model = "HSMM", R_vec = R_vec)
+
+
+fitted_states <- unlist(fitted_states)
+
+cm <- table(fitted_states, cole_condition_labels)
+
+assign <- solve_LSAP(cm, maximum = TRUE)
+aligned_states <- assign[fitted_states]
+
+cm <- table(cole_condition_labels, aligned_states)
+
+cat("State assignment is: \n")
+assign
+
+cat("Proportion of time spent in each state for condition: \n")
+table(fitted_states)/length(fitted_states)
+
+cat("Activity counts for condition: \n")
+nbhsmm_fit$mu
+
+nbhsmm_fit$sigma
+
+
+nbhsmm_fit$z
+
+
+
+cat("NB distributions: \n")
+nbhsmm_fit$nb_mu
+
+
+
+n <- sum(cm) # number of instances
+diag <- diag(cm) # number of correctly classified instances per class 
+accuracy <- sum(diag) / n 
+
+cat("Agreement with Cole-Kripke for conditions: \n")
+accuracy
+
+```
+
+
+## nb-HSMM for control
+
+
+```{r}
+
+
+nbhsmm_fit_control <- mle_nbhsmm_multiple(mu0, sigma0, z0, nb_size0, nb_mu0, cond_tpm0,
+                                  J, control_data, R_vec)
+
+
+```
+
+```{r}
+
+fitted_states <- my_viterbi_decoder(nbhsmm_fit_control$delta, nbhsmm_fit_control$tpm, control_data, J, 
+                                    nbhsmm_fit_control$mu, nbhsmm_fit_control$sigma, nbhsmm_fit_control$z ,model = "HSMM", R_vec = R_vec)
+
+
+fitted_states <- unlist(fitted_states)
+
+cm <- table(fitted_states, cole_control_labels)
+
+assign <- solve_LSAP(cm, maximum = TRUE)
+aligned_states <- assign[fitted_states]
+
+cm <- table(cole_control_labels, aligned_states)
+
+cat("State assignment is: \n")
+assign
+
+cat("Proportion of time spent in each state for condition: \n")
+table(fitted_states)/length(fitted_states)
+
+cat("Activity counts for control: \n")
+nbhsmm_fit_control$mu
+
+
+nbhsmm_fit_control$sigma
+
+
+nbhsmm_fit_control$z
+
+cat("NB distributions: \n")
+nbhsmm_fit_control$nb_mu
+
+n <- sum(cm) # number of instances
+diag <- diag(cm) # number of correctly classified instances per class 
+accuracy <- sum(diag) / n 
+
+cat("Agreement with Cole-Kripke for control: \n")
+accuracy
+
+```
+
+
+
+## QREML
+
+## QREML for condition
+
+
+```{r}
+
+m <- 2
+S <- lapply(R_vec, function(Ri) crossprod(makeD(Ri, m)))
+
+# same init as HMM and nb-HSMM
+p_list <- lapply(seq_len(J), function(i){
+  p <- dgeom(0:R_vec[i], prob = 0.1)
+  p / sum(p)
+})
+
+
+par <- natural_to_unc_nonp_hsmm(mu0, sigma0, z0, p_list, cond_tpm0, J)
+
+dat <- list(data_list = condition_data,
+            J = J,
+            R_vec = R_vec,
+            S = S,
+            lambda = rep(1e2, J))
+
+
+qreml_fit <- qreml_capped(pen_nll, par, dat, random = paste0("unc_p", seq_len(J)))
+est <- extract_relevant_pars(qreml_fit, model = "nonp", R_vec = R_vec, J = J)
+
+```
+
+
+```{r}
+
+paths <- my_viterbi_decoder(qreml_fit$delta, est$hmm_tpm, condition_data, J,
+                            qreml_fit$mu, qreml_fit$sigma, qreml_fit$z ,model = "HSMM", R_vec = R_vec)
+
+fitted_states <- unlist(paths)
+
+cm <- table(fitted_states, cole_condition_labels)
+
+assign <- solve_LSAP(cm, maximum = TRUE)
+aligned_states <- assign[fitted_states]
+
+cm <- table(cole_condition_labels, aligned_states)
+
+```
+
+
+```{r}
+
+cat("State assignment is: \n")
+assign
+
+cat("Proportion of time spent in each state for condition: \n")
+table(fitted_states)/length(fitted_states)
+
+cat("Activity counts for condition: \n")
+qreml_fit$mu
+
+qreml_fit$sigma
+
+qreml_fit$z
+
+n <- sum(cm) 
+diag <- diag(cm) 
+accuracy <- sum(diag) / n 
+
+cat("Agreement with Cole-Kripke for condition: \n")
+accuracy
+
+```
+
+
+
+## QREML for control
+
+
+```{r}
+
+dat <- list(data_list = control_data,
+            J = J,
+            R_vec = R_vec,
+            S = S,
+            lambda = rep(1e2, J))
+
+
+qreml_fit_control <- qreml_capped(pen_nll, par, dat, random = paste0("unc_p", seq_len(J)))
+est_control <- extract_relevant_pars(qreml_fit_control, model = "nonp", R_vec = R_vec, J = J)
+
+```
+
+
+```{r}
+
+paths <- my_viterbi_decoder(qreml_fit_control$delta, est_control$hmm_tpm, control_data, J,
+                            qreml_fit_control$mu, qreml_fit_control$sigma, qreml_fit_control$z ,model = "HSMM", R_vec = R_vec)
+
+fitted_states <- unlist(paths)
+
+cm <- table(fitted_states, cole_control_labels)
+
+assign <- solve_LSAP(cm, maximum = TRUE)
+aligned_states <- assign[fitted_states]
+
+cm <- table(cole_control_labels, aligned_states)
+
+```
+
+
+```{r}
+
+cat("State assignment is: \n")
+assign
+
+cat("Proportion of time spent in each state for condition: \n")
+table(fitted_states)/length(fitted_states)
+
+cat("Activity counts for condition: \n")
+qreml_fit_control$mu
+qreml_fit_control$sigma
+qreml_fit_control$z
+
+n <- sum(cm) # number of instances
+diag <- diag(cm) # number of correctly classified instances per class 
+accuracy <- sum(diag) / n 
+
+cat("Agreement with Cole-Kripke for control: \n")
+accuracy
+
+```
+
+
+## Save fitted models for later checks and plotting
+
+```{r}
+
+saveRDS(
+  list(hmm_fit = hmm_fit, hmm_fit_control = hmm_fit_control,
+       nbhsmm_fit = nbhsmm_fit, nbhsmm_fit_control = nbhsmm_fit_control,
+       qreml_fit = qreml_fit, qreml_fit_control = qreml_fit_control,
+       est = est, est_control = est_control, # transformed qREML params
+       #condition_data = condition_data, control_data = control_data,
+       S = S, J = J, R_vec = R_vec),
+  "actigraph_fits.rds")
+
+```
+
+# Plot dwell-time
+
+
+```{r}
+
+
+R_eval <- 90   
+J <- 2
+R_vec  <- c(40, 80)   
+
+fits <- list(
+  list(obj = hmm_fit, model = "HMM", grp = "Group with depressive disorders", tag = "hmm"),
+  list(obj = hmm_fit_control, model = "HMM",grp = "Control group", tag = "hmm"),
+  list(obj = nbhsmm_fit, model = "nb-HSMM", grp = "Group with depressive disorders", tag = "nb"),
+  list(obj = nbhsmm_fit_control,  model = "nb-HSMM", grp = "Control group", tag = "nb"))
+
+state_lab <- c("Rest", "Active")
+
+dwell_long <- rbindlist(lapply(fits, function(f){
+  pars <- extract_relevant_pars(f$obj, model = f$tag, R_vec = R_vec, J = J)
+  D    <- build_dwell_matrix(pars, model = f$tag, J = J, R_vec = R_vec, R_eval = R_eval)
+  rbindlist(lapply(1:J, function(s){
+    data.table(model = f$model, group = f$grp, state = state_lab[s],
+               duration = 1:R_eval, prob = D[s, ])
+  }))
+}))
+
+# lock facet order
+dwell_long[, model := factor(model, levels = c("HMM", "nb-HSMM", "qREML-HSMM"))]
+dwell_long[, state := factor(state, levels = c("Rest", "Active"))]
+
+hmm_nb_dwell_dep <- ggplot(dwell_long, aes(duration, prob, colour = group, linetype = group)) +
+  geom_line(linewidth = 0.7) +
+  facet_grid(model ~ state, scales = "free") +
+  facetted_pos_scales(
+    x = list(
+      state == "Rest"   ~ scale_x_continuous(limits = c(0, 50),
+                                             breaks = seq(0, 48, 8),
+                                             labels = function(x) x / 4),
+      state == "Active" ~ scale_x_continuous(limits = c(0, 85),
+                                             breaks = seq(0, 80, 16),
+                                             labels = function(x) x / 4)
+    )
+  ) +
+  scale_colour_manual(values = c("Group with depressive disorders" = "#1B7837",
+                               "Control group" = "#333333"))  +
+  labs(x = "Dwell duration (hours)", y = "Estimated probability",
+       colour = NULL, linetype = NULL) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top",
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "plain"))
+
+ggsave(filename = "hmm_nb_dwell_dep.pdf", hmm_nb_dwell_dep, width = 8, height = 6)
+
+```
+
+
+```{r}
+
+library(ggh4x)
+
+R_eval <- 90
+J <- 2
+R_vec  <- c(40, 80)
+
+qreml_fits <- list(
+  list(obj = qreml_fit, grp = "Group with depressive disorders"),
+  list(obj = qreml_fit_control, grp = "Control group")
+)
+
+state_lab <- c("Rest", "Active")
+
+qreml_long <- rbindlist(lapply(qreml_fits, function(f){
+  pars <- extract_relevant_pars(f$obj, model = "nonp", R_vec = R_vec, J = J)
+  D    <- build_dwell_matrix(pars, model = "nonp", J = J, R_vec = R_vec, R_eval = R_eval)
+  rbindlist(lapply(1:J, function(s){
+    data.table(group = f$grp, state = state_lab[s],
+               duration = 1:R_eval, prob = D[s, ])
+  }))
+}))
+
+qreml_long[, state := factor(state, levels = c("Rest", "Active"))]
+
+qreml_dwell_dep <- ggplot(qreml_long, aes(duration, prob, colour = group, linetype = group)) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ state, scales = "free") +
+  facetted_pos_scales(
+    x = list(
+      state == "Rest"   ~ scale_x_continuous(limits = c(0, 45),
+                                             breaks = seq(0, 48, 8),
+                                             labels = function(x) x / 4),
+      state == "Active" ~ scale_x_continuous(limits = c(0, 85),
+                                             breaks = seq(0, 84, 16),
+                                             labels = function(x) x / 4)
+    ),
+    y = list(
+      state == "Rest"   ~ scale_y_continuous(limits = c(0, 0.13)),
+      state == "Active" ~ scale_y_continuous(limits = c(0, 0.25))
+    )
+  ) +
+  scale_colour_manual(values = c("Group with depressive disorders" = "#1B7837", "Control group" = "#333333")) +
+  labs(x = "Dwell-time (hours)", y = "Estimated probability",
+       colour = NULL, linetype = NULL) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top",
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "plain"))
+
+
+ggsave(filename = "qreml_dwell_dep.pdf", qreml_dwell_dep, width = 8, height = 6)
+
+```
+
+
+## Example illustration on two single subjects
+
+
+```{r}
+
+
+# rebuild per-subject decoded lists
+fitted_states <- my_viterbi_decoder(qreml_fit$delta, est$hmm_tpm, condition_data, J,
+                                    qreml_fit$mu, qreml_fit$sigma, qreml_fit$z,
+                                    model = "HSMM", R_vec = R_vec)
+fitted_states_control <- my_viterbi_decoder(qreml_fit_control$delta, est_control$hmm_tpm,
+                                            control_data, J,
+                                            qreml_fit_control$mu, qreml_fit_control$sigma,
+                                            qreml_fit_control$z, model = "HSMM", R_vec = R_vec)
+
+dep_idx <- 8L
+con_idx <- 8L
+state_lab <- c("Rest", "Active")  
+
+build_panel <- function(bins, decoded, idx, group_lab){
+  b <- as.data.table(bins[[idx]])
+  s <- decoded[[idx]]
+  n <- min(nrow(b), length(s))
+
+
+  start <- which(as.numeric(format(b$bin, "%H")) +
+                 as.numeric(format(b$bin, "%M")) / 60 >= 9)[1]
+  w <- start:(start + 96 - 1)      
+  w <- w[w <= n]                   
+
+  data.table(
+    group    = group_lab,
+    elapsed  = (seq_along(w) - 1) * 0.25,   # hours from 09:00
+    activity = as.numeric(b$activity[w]),
+    state    = factor(state_lab[s[w]], levels = c("Rest", "Active"))
+  )
+}
+
+panel <- rbind(
+  build_panel(condition_bins, fitted_states, dep_idx, "Subject with a depressive disorder"),
+  build_panel(control_bins,   fitted_states_control, con_idx, "Control subject")
+)
+panel[, group := factor(group, levels = c("Subject with a depressive disorder", "Control subject"))]
+
+
+panel[, run := rleid(state), by = group]
+segs <- panel[, .(xstart = min(elapsed), state = state[1]), by = .(group, run)]
+segs[, xend := shift(xstart, type = "lead"), by = group]
+grp_max <- panel[, .(tmax = max(elapsed)), by = group]
+segs[grp_max, on = "group", tmax := i.tmax]
+segs[is.na(xend), xend := tmax]
+segs[, tmax := NULL]
+
+
+brk <- seq(0, 24, 3)
+lab <- sprintf("%02d:00", (9 + brk) %% 24)
+
+act_decoded <- ggplot() +
+  geom_rect(data = segs,
+            aes(xmin = xstart, xmax = xend, ymin = -Inf, ymax = Inf, fill = state)) +
+  geom_line(data = panel, aes(elapsed, activity), linewidth = 0.6, colour = "grey15") +
+  facet_wrap(~ group, ncol = 1) +
+  scale_fill_manual(values = c(Rest = "#D5E3F2", Active = "#FCE4CF"), name = NULL)  +
+  scale_x_continuous(breaks = brk, labels = lab, expand = c(0, 0)) +
+  labs(x = "Time of day", y = "Activity count") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top",
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "plain"))
+
+ggsave(filename = "act_decoded.pdf", act_decoded, width = 10, height = 6)
+
+```
+
+
+
+

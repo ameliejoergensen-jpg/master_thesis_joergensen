@@ -1,0 +1,11 @@
+"T_len","N","order_diff","sojourn","emission","scenario_id","seed"
+1000,30,2,"all_geometric","medium_overlap",1,5001
+1000,30,2,"one_nb","medium_overlap",2,5002
+1000,30,2,"one_bimodal","medium_overlap",3,5003
+1000,30,2,"one_nb_one_spike","medium_overlap",4,5004
+1000,30,2,"spikes","medium_overlap",5,5005
+1000,30,2,"all_geometric","high_overlap",6,5006
+1000,30,2,"one_nb","high_overlap",7,5007
+1000,30,2,"one_bimodal","high_overlap",8,5008
+1000,30,2,"one_nb_one_spike","high_overlap",9,5009
+1000,30,2,"spikes","high_overlap",10,5010

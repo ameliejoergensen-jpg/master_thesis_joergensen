@@ -1,0 +1,344 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-08-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+rm(list = ls())
+library(data.table)
+library(lubridate)
+library(actigraph.sleepr)
+library(LaMa)
+library(RTMB)
+library(xtable)
+
+source("git_master_act_functions.R")
+
+```
+
+# Load actigraph data
+
+```{r}
+
+read_group <- function(dir){
+  files <- list.files(dir, full.names = TRUE)
+  lapply(files, function(f){
+    d <- read.csv(f)
+    d$subject <- tools::file_path_sans_ext(basename(f))
+    d
+  })
+}
+
+# placeholder for downloaded conditions and control file paths
+# condition_all <- read_group("Users/Downloads/depresjon/condition")
+# control_all <- read_group("/Users/Downloads/depresjon/control")
+
+
+```
+
+
+# data cleaning
+
+```{r}
+
+settings <- data.frame(epochlength = 60L)
+
+clean_subject <- function(d){
+  d <- setDT(d)
+  d[, timestamp := as.POSIXct(timestamp, tz = "Europe/Oslo")] # study data from Oslo, needed because of time change to summer time in some recordings (causes issues)
+  
+  # required format for algorithms
+  d[, `:=`(axis1 = activity, axis2 = 0, axis3 = 0)]
+  
+  d <- d[!is.na(timestamp)][!duplicated(timestamp)]
+
+  # apply Choi for non-wear
+  # set detected periods to missing to avoid including invalid data
+  # high min length to avoid falsely removing sleep
+  periods <- apply_choi(tbl_agd(d, settings), use_magnitude = FALSE, min_period_len = 540)
+  if (nrow(periods) > 0){
+    nonwear <- Reduce(`|`, Map(function(s, e) d$timestamp >= s & d$timestamp <= e,
+                               periods$period_start, periods$period_end))
+    d[nonwear, activity := NA]
+  }
+
+  # aggregate to 15-min bins
+  d[, bin := floor_date(timestamp, "15 minutes")]
+  b <- d[, .(activity = mean(activity, na.rm = TRUE)), by = bin]
+  b[is.nan(activity), activity := NA]
+
+  full <- data.table(bin = seq(min(b$bin), max(b$bin), by = "15 min"))
+  b <- b[full, on = "bin"]
+  b[, id := d$subject[1]][]
+}
+
+condition_bins <- lapply(condition_all, clean_subject)
+control_bins <- lapply(control_all, clean_subject)
+
+condition_data <- lapply(condition_bins, function(d) matrix(as.numeric(d$activity), ncol = 1))
+control_data <- lapply(control_bins, function(d) matrix(as.numeric(d$activity), ncol = 1))
+
+
+```
+
+# HMM initial values
+
+```{r}
+
+J <- 2 # rest vs active
+mu0 <- matrix(c(20, 250), nrow = 1) # same as for overall fit, so low for rest, high for active
+sigma0 <- matrix(c(30, 200), nrow = 1)
+z0 <- matrix(c(0.15, 0.001), nrow = 1) # zero inflated rest state
+tpm0 <- matrix(c(0.9, 0.1,
+                 0.1, 0.9), nrow = 2, byrow = TRUE)
+
+
+```
+
+# Leave-one-out classification
+
+```{r}
+
+library(parallel)
+
+# same as before, for zero inflated Gamma emissions
+emis_zigamma <- function(fit, X){   # T x J emission matrix (per state aggregate)
+  T_len <- nrow(X)
+  J <- ncol(fit$mu)
+  ap <- matrix(1, T_len, J)
+  
+  for (j in seq_len(J)){
+    pj <- rep(1, T_len)
+    
+    for (k in seq_len(ncol(X))){
+      x <- X[, k]
+      sh <- (fit$mu[k, j] / fit$sigma[k, j])^2
+      sc <- fit$sigma[k, j]^2 / fit$mu[k, j]
+      dk <- rep(1, T_len) # for NA
+      
+      is0 <- !is.na(x) & x == 0
+      pos <- !is.na(x) & x != 0
+      
+      # account for zero counts
+      dk[is0] <- fit$z[k, j]
+      dk[pos] <- (1 - fit$z[k, j]) * dgamma(x[pos], shape = sh, scale = sc)
+      pj <- pj * dk
+    }
+    ap[, j] <- pj
+  }
+  ap
+}
+
+loglik_hmm  <- function(fit, X)
+  -my_forward_hsmm(fit$delta, fit$tpm, emis_zigamma(fit, X), nrow(X))
+
+loglik_hsmm <- function(fit, X, R_vec){ # recycle each aggregate across its sub-states
+  ap <- emis_zigamma(fit, X)[, rep(seq_len(ncol(fit$mu)), times = R_vec), drop = FALSE]
+  -my_forward_hsmm(fit$delta, fit$tpm_hmm, ap, nrow(X))
+}
+
+
+# Leave-one out cross validation
+
+# leave one subject out, fit models on remaining subjects
+# one per group with depressive disorders, one for controls
+# assign held-out subject to group whose fitted model gave higher likelihood
+# repeat until all subjects are held out once
+
+# gc and pre_schedule FALSE because creating AD tape is expensive!
+# if run interrupted, resumes only for the ones still missing
+
+loso_classify <- function(fit_two, score, ncores = 5, tag = "loso"){
+  
+  nD <- length(condition_data)
+  nC <- length(control_data)
+  all_data <- c(condition_data, control_data)
+  all_grp <- c(rep("Depression", nD), rep("Control", nC))
+  
+  all_id <- tryCatch(
+    c(vapply(condition_bins, function(d) d$id[1], ""),
+      vapply(control_bins, function(d) d$id[1], "")),
+    error = function(e) sprintf("subj_%03d", seq_len(nD + nC)))
+  N <- nD + nC
+
+  resdir <- tag
+  logfile <- paste0(tag, ".log")
+  
+  dir.create(resdir, showWarnings = FALSE)
+  
+  cat(sprintf("LOSO start %s | N=%d | cores=%d | dir=%s\n",
+              format(Sys.time(), "%H:%M:%S"), N, ncores, resdir),
+      file = logfile, append = TRUE)
+
+  one <- function(i){
+    truth <- all_grp[i]
+    resfile <- file.path(resdir, paste0(all_id[i], ".rds"))
+
+    # skip existing subjects (ensures progress is saved if run interrupted)
+    if (file.exists(resfile)){                    
+      cat(sprintf("[%s] %2d/%d  %-14s skip (done)\n",
+                  format(Sys.time(), "%H:%M:%S"), i, N, all_id[i]),
+          file = logfile, append = TRUE)
+      return(readRDS(resfile)$pred)
+    }
+
+    dep <- condition_data
+    con <- control_data
+    if (i <= nD){
+      dep <- condition_data[-i]
+      } else {
+        con <- control_data[-(i - nD)]}
+
+    pred <- tryCatch({
+      fits <- fit_two(dep, con)
+      p <- if (score(fits$dep, all_data[[i]]) > score(fits$con, all_data[[i]]))
+             "Depression" else "Control"
+      rm(fits)
+      gc()  # memory                            
+      p
+    }, error = function(e){ 
+      gc()
+      NA_character_ })
+
+    if (!is.na(pred)){          
+      tmp <- paste0(resfile, ".tmp")
+      saveRDS(data.frame(id = all_id[i], true = truth, pred = pred,
+                         stringsAsFactors = FALSE), tmp)
+      file.rename(tmp, resfile)         
+    }
+
+    line <- sprintf("[%s] %2d/%d  %-14s true=%-10s pred=%-10s %s\n",
+                    format(Sys.time(), "%H:%M:%S"), i, N, all_id[i], truth,
+                    ifelse(is.na(pred), "NA", pred),
+                    if (is.na(pred)) "(failed)" else if (pred == truth) "OK" else "x")
+    cat(line)             
+    cat(line, file = logfile, append = TRUE)    
+    pred}
+
+  # parallelize
+  res <- mclapply(seq_len(N), one, mc.cores = ncores, mc.preschedule = FALSE)
+  pred <- vapply(res, function(x) if (is.character(x) && length(x) == 1L) x else NA_character_, "")
+  ok <- !is.na(pred)
+
+  cat(sprintf("LOSO done  %s | acc=%.3f | failed=%d\n",
+              format(Sys.time(), "%H:%M:%S"),
+              mean(pred[ok] == all_grp[ok]), sum(!ok)),
+      file = logfile, append = TRUE)
+
+  list(accuracy = mean(pred[ok] == all_grp[ok]),
+       n_failed = sum(!ok),
+       table = table(true = all_grp[ok], pred = pred[ok]),
+       pred = pred, resdir = resdir, logfile = logfile)
+}
+
+collect_loso <- function(tag){
+  f <- list.files(tag, pattern = "\\.rds$", full.names = TRUE)
+  d <- do.call(rbind, lapply(f, readRDS))
+  list(accuracy = mean(d$pred == d$true),
+       table = table(true = d$true, pred = d$pred), data = d)}
+
+
+# HMM
+
+res_hmm <- loso_classify(
+  function(dep, con) list(
+    # fit HMMs (one per group)
+    dep = mle_hmm_multiple(mu0, sigma0, z0, tpm0, J, dep),
+    con = mle_hmm_multiple(mu0, sigma0, z0, tpm0, J, con)),
+  function(fit, X) loglik_hmm(fit, X),
+  ncores = 5, tag = "loso_hmm")
+
+# nb-HSMM
+
+R_vec <- c(40, 80)
+nb_size0 <- c(2, 2)
+nb_mu0 <- c(10, 10)
+cond_tpm0 <- matrix(c(0, 1, 1, 0), 2, 2, byrow = TRUE)
+
+res_nb <- loso_classify(
+  function(dep, con) list(
+    # one nb-HSMM per group
+    dep = mle_nbhsmm_multiple(mu0, sigma0, z0, nb_size0, nb_mu0, cond_tpm0, J, dep, R_vec),
+    con = mle_nbhsmm_multiple(mu0, sigma0, z0, nb_size0, nb_mu0, cond_tpm0, J, con, R_vec)),
+  function(fit, X) loglik_hsmm(fit, X, R_vec),
+  ncores = 5, tag = "loso_nbhsmm")
+
+# qREML-HSMM
+
+# penalize second-order differences, same as simulation
+m <- 2
+S <- lapply(R_vec, function(Ri) crossprod(makeD(Ri, m)))
+
+p_list <- lapply(seq_len(J), function(i){ p <- dgeom(0:R_vec[i], prob = 0.1)
+p / sum(p) })
+
+par <- natural_to_unc_nonp_hsmm(mu0, sigma0, z0, p_list, cond_tpm0, J)
+
+fit_qreml <- function(data_list){
+  dat <- list(data_list = data_list, J = J, R_vec = R_vec, S = S, lambda = rep(1e2, J))
+  f <- qreml_capped(pen_nll, par, dat, random = paste0("unc_p", seq_len(J)))
+  p <- extract_relevant_pars(f, "nonp", R_vec, J)
+  list(mu = p$mu, sigma = p$sigma, z = p$z, delta = p$delta, tpm_hmm = p$hmm_tpm)
+}
+
+res_qreml <- loso_classify(
+  function(dep, con) list(dep = fit_qreml(dep), con = fit_qreml(con)),
+  function(fit, X) loglik_hsmm(fit, X, R_vec),
+  ncores = 5, tag = "loso_qreml")
+
+# Results
+
+sapply(list(HMM = res_hmm, nbHSMM = res_nb, qREML = res_qreml),
+       function(r) c(accuracy = r$accuracy, failed = r$n_failed))
+
+
+```
+
+
+# create results table
+
+```{r}
+
+metrics <- function(tag){
+  d <- collect_loso(tag)$data
+  cm <- table(true = factor(d$true, c("Control","Depression")),
+              pred = factor(d$pred, c("Control","Depression")))
+  
+  TP <- cm["Depression","Depression"]
+  FN <- cm["Depression","Control"]
+  
+  FP <- cm["Control","Depression"]
+  TN <- cm["Control","Control"]
+  
+  sens <- TP/(TP+FN)
+  prec <- TP/(TP+FP)
+  c(Accuracy = (TP+TN)/sum(cm), Sensitivity = sens,
+    Specificity = TN/(TN+FP), F1 = 2*prec*sens/(prec+sens))
+}
+
+metric_tab <- t(sapply(
+  c(HMM = "loso_hmm", `nb-HSMM` = "loso_nbhsmm", qREML = "loso_qreml"),
+  metrics))
+round(metric_tab, 3)
+
+print(xtable(metric_tab, digits = 3, align = "lcccc",
+             caption = "Leave-one-out classification performance.",
+             label = "tab:loso"),
+      booktabs = TRUE, caption.placement = "top")
+
+
+```
+
+
+
+
+
+
+
+
